@@ -1,4 +1,4 @@
-﻿// -----------------------------------------------------------------------
+// -----------------------------------------------------------------------
 //  <copyright file="SqlReadJournal.cs" company="Akka.NET Project">
 //      Copyright (C) 2013-2023 .NET Foundation <https://github.com/akkadotnet/akka.net>
 //  </copyright>
@@ -10,7 +10,6 @@ using System.Collections.Immutable;
 using System.Linq;
 using System.Threading.Tasks;
 using Akka.Actor;
-using Akka.Event;
 using Akka.Pattern;
 using Akka.Persistence.Journal;
 using Akka.Persistence.Query;
@@ -48,8 +47,6 @@ namespace Akka.Persistence.Sql.Query
         private readonly ReadJournalConfig _readJournalConfig;
         private readonly ByteArrayReadJournalDao _readJournalDao;
         private readonly ExtendedActorSystem _system;
-        private readonly IActorRef _queryPermitter;
-        private readonly ILoggingAdapter _log;
 
         public SqlReadJournal(
             ExtendedActorSystem system,
@@ -62,9 +59,12 @@ namespace Akka.Persistence.Sql.Query
             if (singleSetup.HasValue)
                 _readJournalConfig = singleSetup.Value.Apply(_readJournalConfig);
             
-            var multiSetup = setup.Get<MultiDataOptionsSetup>();
-            if (multiSetup.HasValue && multiSetup.Value.TryGetDataOptionsFor(_readJournalConfig.PluginId, out var dataOptions))
-                _readJournalConfig = _readJournalConfig.WithDataOptions(dataOptions);
+            if (_readJournalConfig.PluginId is not null)
+            {
+                var multiSetup = setup.Get<MultiDataOptionsSetup>();
+                if (multiSetup.HasValue && multiSetup.Value.TryGetDataOptionsFor(_readJournalConfig.PluginId, out var dataOptions))
+                    _readJournalConfig = _readJournalConfig.WithDataOptions(dataOptions);
+            }
 
             _eventAdapters = Persistence.Instance.Apply(system).AdaptersFor(_readJournalConfig.WritePluginId);
             
@@ -82,11 +82,6 @@ namespace Akka.Persistence.Sql.Query
                 settings: ActorMaterializerSettings.Create(system),
                 namePrefix: $"l2db-query-mat-{Guid.NewGuid():N}");
 
-            _log = Logging.GetLogger(system, $"{_readJournalConfig.PluginId}-{nameof(SqlReadJournal)}");
-            _queryPermitter = system.ActorOf(
-                Props.Create(() => new QueryThrottler(_readJournalConfig.MaxConcurrentQueries)), 
-                $"{_readJournalConfig.PluginId}-query-permitter");
-
             _readJournalDao = new ByteArrayReadJournalDao(
                 scheduler: system.Scheduler.Advanced,
                 materializer: _mat,
@@ -97,7 +92,6 @@ namespace Akka.Persistence.Sql.Query
                     serializer: system.Serialization,
                     separator: _readJournalConfig.PluginConfig.TagSeparator,
                     writerUuid: null),
-                _queryPermitter,
                 // TODO: figure out a way to signal shutdown to the query executor here
                 default);
 
@@ -219,13 +213,14 @@ namespace Akka.Persistence.Sql.Query
                             timestamp: r.representation.Timestamp, 
                             tags: r.tags));
 
-        private Source<EventEnvelope, NotUsed> CurrentJournalEvents(long offset, long max, MaxOrderingId latestOrdering)
+        private Source<EventEnvelope, Task<long>> CurrentJournalEvents(long offset, long max, MaxOrderingId latestOrdering)
         {
             if (latestOrdering.Max < offset)
-                return Source.Empty<EventEnvelope>();
+                return Source.Empty<EventEnvelope>().MapMaterializedValue(_ => Task.FromResult(0L));
 
             return _readJournalDao
                 .Events(offset, latestOrdering.Max, max)
+                .AlsoToMaterialized(Sink.Aggregate(0L, (count, _) => count + 1), Keep.Right)
                 .SelectAsync(1, r => Task.FromResult(r.Get()))
                 .SelectMany(
                     a =>
@@ -366,10 +361,15 @@ namespace Akka.Persistence.Sql.Query
                                     GetMaxOrderingId.Instance,
                                     askTimeout);
 
-                            var xs = await CurrentJournalEvents(uf.offset, batchSize, queryUntil)
-                                .RunWith(Sink.Seq<EventEnvelope>(), _mat);
+                            var (xsTask, readCountTask) = CurrentJournalEvents(uf.offset, batchSize, queryUntil)
+                                .ToMaterialized(Sink.Seq<EventEnvelope>(), Keep.Both)
+                                .Run(_mat);
 
-                            var hasMoreEvents = xs.Count == batchSize;
+                            await Task.WhenAll(xsTask, readCountTask);
+                            var xs = xsTask.Result;
+                            var readCount = readCountTask.Result;
+
+                            var hasMoreEvents = readCount == batchSize;
 
                             var nextControl = FlowControlEnum.Unknown;
                             if (terminateAfterOffset.HasValue)
